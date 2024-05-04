@@ -1,0 +1,411 @@
+//VERY IMPORTANT
+//monitor_flags = --raw
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+
+String dId = "PRT001";
+String webhook_pass = "VqUI8YzVXy";
+String webhook_endpoint = "http://64.23.144.136:3001/api/getdevicecredentials";
+const char *mqtt_server = "64.23.144.136";
+
+//PINS
+#define led 2
+
+//WiFi
+const char *wifi_ssid = "GOLD2";
+const char *wifi_password = "Tesla208";
+
+//Functions definitions
+bool get_mqtt_credentials();
+void check_mqtt_connection();
+bool reconnect();
+void process_sensors();
+void process_actuators();
+void send_data_to_broker();
+void callback(char* topic, byte* payload, unsigned int length);
+void process_incoming_msg(String topic, String incoming);
+void print_stats();
+void clear();
+
+//Global Vars
+WiFiClient espclient;
+PubSubClient client(espclient);
+long lastReconnectAttemp = 0;
+long varsLastSend[20];
+String last_received_msg = "";
+String last_received_topic = "";
+int prev_temp = 0;
+int prev_hum = 0;
+
+DynamicJsonDocument mqtt_data_doc(2048);
+
+void setup()
+{
+
+  Serial.begin(921600);
+  pinMode(led, OUTPUT);
+  clear();
+
+  Serial.print( "\n\n\nWiFi Connection in Progress");
+
+  WiFi.begin("Wokwi-GUEST", "", 6);
+
+  int counter = 0;
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+    counter++;
+
+    if (counter > 10)
+    {
+      Serial.print("  ⤵" );
+      Serial.print("\n\n         Ups WiFi Connection Failed :( ");
+      Serial.println(" -> Restarting...");
+      delay(2000);
+      ESP.restart();
+    }
+  }
+
+  Serial.print("  ⤵" );
+
+  //Printing local ip
+  Serial.println("\n\n         WiFi Connection -> SUCCESS :)");
+  Serial.print("\n         Local IP -> ");
+  Serial.print(WiFi.localIP());
+
+  client.setCallback(callback);
+
+}
+
+void loop()
+{
+  check_mqtt_connection();
+  
+}
+
+
+
+//USER FUNTIONS ⤵
+void process_sensors()
+{
+
+  //get temp simulation
+  int temp = random(1, 100);
+  mqtt_data_doc["variables"][0]["last"]["value"] = temp;
+
+  //save temp?
+  int dif = temp - prev_temp;
+  if (dif < 0)
+  {
+    dif *= -1;
+  }
+
+  if (dif >= 5)
+  {
+    mqtt_data_doc["variables"][0]["last"]["save"] = 1;
+  }
+  else
+  {
+    mqtt_data_doc["variables"][0]["last"]["save"] = 0;
+  }
+
+  prev_temp = temp;
+
+  //get humidity simulation
+  int hum = random(1, 50);
+  mqtt_data_doc["variables"][1]["last"]["value"] = hum;
+
+  //save hum?
+  dif = hum - prev_hum;
+  if (dif < 0)
+  {
+    dif *= -1;
+  }
+
+  if (dif >= 5)
+  {
+    mqtt_data_doc["variables"][1]["last"]["save"] = 1;
+  }
+  else
+  {
+    mqtt_data_doc["variables"][1]["last"]["save"] = 0;
+  }
+
+  prev_hum = hum;
+
+  //get led status
+  mqtt_data_doc["variables"][4]["last"]["value"] = (HIGH == digitalRead(led));
+}
+
+void process_actuators()
+{
+  if (mqtt_data_doc["variables"][2]["last"]["value"] == "true")
+  {
+    digitalWrite(led, HIGH);
+    mqtt_data_doc["variables"][2]["last"]["value"] = "";
+    varsLastSend[4] = 0;
+  }
+  else if (mqtt_data_doc["variables"][3]["last"]["value"] == "false")
+  {
+    digitalWrite(led, LOW);
+    mqtt_data_doc["variables"][3]["last"]["value"] = "";
+    varsLastSend[4] = 0;
+  }
+
+}
+
+
+
+
+//TEMPLATE ⤵
+void process_incoming_msg(String topic, String incoming) {
+
+  Serial.println("\n\n --->>PROCESS INCOMING :)");
+  last_received_topic = topic;
+  last_received_msg = incoming;
+
+  // Encuentra la posición del segundo '/'
+  int firstSlashPos = topic.indexOf('/');
+  int secondSlashPos = topic.indexOf('/', firstSlashPos + 1);
+
+  // Extrae la parte entre el segundo '/' y 'actdata'
+  String variable = topic.substring(secondSlashPos + 1, topic.indexOf("/actdata"));
+
+  // Imprime el identificador de la variable
+  Serial.println("Identificador de la variable: " + variable);
+
+  // Busca la variable en mqtt_data_doc
+  for (int i = 0; i < mqtt_data_doc["variables"].size(); i++) {
+    if (mqtt_data_doc["variables"][i]["variable"] == variable) {
+      DynamicJsonDocument doc(256);
+      deserializeJson(doc, incoming);
+      mqtt_data_doc["variables"][i]["last"] = doc;
+
+      long counter = mqtt_data_doc["variables"][i]["counter"];
+      counter++;
+      mqtt_data_doc["variables"][i]["counter"] = counter;
+    }
+  }
+
+  // Llama a process_actuators()
+  process_actuators();
+}
+
+
+void callback(char* topic, byte* payload, unsigned int length)
+{
+  Serial.println("\n\n CALLBACK :)");
+  String incoming = "";
+
+  for (int i = 0; i < length; i++)
+  {
+    incoming += (char)payload[i];
+  }
+
+  incoming.trim();
+
+  process_incoming_msg(String(topic), incoming);
+
+}
+
+void send_data_to_broker()
+{
+
+  long now = millis();
+
+  for (int i = 0; i < mqtt_data_doc["variables"].size(); i++)
+  {
+
+    if (mqtt_data_doc["variables"][i]["variableType"] == "output")
+    {
+      continue;
+    }
+
+    int freq = mqtt_data_doc["variables"][i]["variableSendFreq"];
+
+    if (now - varsLastSend[i] > freq * 1000)
+    {
+      varsLastSend[i] = millis();
+
+      String str_root_topic = mqtt_data_doc["topic"];
+      String str_variable = mqtt_data_doc["variables"][i]["variable"];
+      String topic = str_root_topic + str_variable + "/sdata";
+
+      String toSend = "";
+
+      serializeJson(mqtt_data_doc["variables"][i]["last"], toSend);
+
+      client.publish(topic.c_str(), toSend.c_str());
+
+
+      //STATS
+      long counter = mqtt_data_doc["variables"][i]["counter"];
+      counter++;
+      mqtt_data_doc["variables"][i]["counter"] = counter;
+
+    }
+  }
+}
+
+bool reconnect()
+{
+
+  if (!get_mqtt_credentials())
+  {
+    Serial.println( "\n\n      Error getting mqtt credentials :( \n\n RESTARTING IN 10 SECONDS");
+    delay(10000);
+    ESP.restart();
+  }
+
+  //Setting up Mqtt Server
+  client.setServer(mqtt_server, 1883);
+
+  Serial.print("\n\n\nTrying MQTT Connection  ⤵");
+
+  String str_client_id = "device_" + dId + "_" + random(1, 9999);
+  const char *username = mqtt_data_doc["username"];
+  const char *password = mqtt_data_doc["password"];
+  String str_topic = mqtt_data_doc["topic"];
+
+  if (client.connect(str_client_id.c_str(), username, password))
+  {
+    Serial.print("\n\n         Mqtt Client Connected :) "+str_topic+"+/actdata");
+    delay(2000);
+  Serial.print("\n\n     Topico :) ");
+   return client.subscribe((str_topic + "+/actdata").c_str());
+  }
+  else
+  {
+    Serial.print("\n\n         Mqtt Client Connection Failed :( " );
+  }
+
+  return false;
+}
+
+void check_mqtt_connection()
+{
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print( "\n\n         Ups WiFi Connection Failed :( ");
+    Serial.println(" -> Restarting..." );
+    delay(15000);
+    ESP.restart();
+  }
+
+  if (!client.connected())
+  {
+
+    long now = millis();
+
+    if (now - lastReconnectAttemp > 5000)
+    {
+      lastReconnectAttemp = millis();
+      if (reconnect())
+      {
+        lastReconnectAttemp = 0;
+      }
+    }
+  }
+  else
+  {
+    client.loop();
+    process_sensors();
+    send_data_to_broker();
+    print_stats();
+  }
+}
+
+bool get_mqtt_credentials()
+{
+
+  Serial.print("\n\n\nGetting MQTT Credentials from WebHook  ⤵");
+  delay(1000);
+
+  String toSend = "dId=" + dId + "&password=" + webhook_pass;
+
+  HTTPClient http;
+  http.begin(webhook_endpoint);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  int response_code = http.POST(toSend);
+
+  if (response_code < 0)
+  {
+    Serial.print("\n\n         Error Sending Post Request :( ");
+    http.end();
+    return false;
+  }
+
+  if (response_code != 200)
+  {
+    Serial.print("\n\n         Error in response :(   e-> " + response_code);
+    http.end();
+    return false;
+  }
+
+  if (response_code == 200)
+  {
+    String responseBody = http.getString();
+
+    Serial.print("\n\n         Mqtt Credentials Obtained Successfully :) " );
+
+    deserializeJson(mqtt_data_doc, responseBody);
+    http.end();
+    delay(1000);
+  }
+
+  return true;
+}
+
+void clear()
+{
+  Serial.print("\r");            // Carácter de retorno de carro
+  Serial.print("                ");  // Espacios en blanco para sobrescribir el texto anterior
+  Serial.print("\r");            // Carácter de retorno de carro nuevamente para volver al principio de la línea
+
+
+}
+
+long lastStats = 0;
+
+void print_stats()
+{
+  long now = millis();
+
+  if (now - lastStats > 2000)
+  {
+    lastStats = millis();
+    clear();
+
+    Serial.print("\n");
+    Serial.print("\n╔══════════════════════════╗" );
+    Serial.print("\n║       SYSTEM STATS       ║" );
+    Serial.print("\n╚══════════════════════════╝");
+    Serial.print("\n\n");
+    Serial.print("\n\n");
+
+    Serial.print(String("#") + "\t Name" + "\t\t Var" + "\t\t Type" + "\t\t Count" + "\t\t Last V\n\n");
+
+    for (int i = 0; i < mqtt_data_doc["variables"].size(); i++)
+    {
+
+      String variableFullName = mqtt_data_doc["variables"][i]["variableFullName"];
+      String variable = mqtt_data_doc["variables"][i]["variable"];
+      String variableType = mqtt_data_doc["variables"][i]["variableType"];
+      String lastMsg = mqtt_data_doc["variables"][i]["last"];
+      long counter = mqtt_data_doc["variables"][i]["counter"];
+
+      Serial.println(String(i) + " \t " + variableFullName.substring(0,5) + " \t\t " + variable.substring(0,10) + " \t " + variableType.substring(0,5) + " \t\t " + String(counter).substring(0,10) + " \t\t " + lastMsg);
+    }
+
+    Serial.print("\n\n Free RAM -> " + String(ESP.getFreeHeap()) + " Bytes");
+
+    Serial.print("\n\n Last Incomming Msg -> "  + last_received_msg);
+  }
+}
